@@ -72,6 +72,11 @@ _C.MODEL.SWIN.QKV_BIAS = True
 _C.MODEL.SWIN.QK_SCALE = None
 _C.MODEL.SWIN.APE = False
 _C.MODEL.SWIN.PATCH_NORM = True
+_C.MODEL.CNN_BACKBONE = "resnet50"
+_C.MODEL.NUM_PROTOTYPES = 50
+_C.MODEL.GRADCAM_TARGET_LAYER = ""  # Optional, only if you want to configure this
+
+
 
 # -----------------------------------------------------------------------------
 # Training settings
@@ -112,6 +117,11 @@ _C.TRAIN.OPTIMIZER.EPS = 1e-8
 _C.TRAIN.OPTIMIZER.BETAS = (0.9, 0.999)
 # SGD momentum
 _C.TRAIN.OPTIMIZER.MOMENTUM = 0.9
+_C.TRAIN.XAI = CN()
+_C.TRAIN.XAI.ENABLE_GRADCAM = True
+_C.TRAIN.XAI.ENABLE_PROTOTYPES = True
+_C.TRAIN.XAI.VIS_FREQUENCY = 10
+
 
 # -----------------------------------------------------------------------------
 # Augmentation settings
