@@ -1,8 +1,6 @@
 # --------------------------------------------------------
-# Swin Transformer
-# Copyright (c) 2021 Microsoft
-# Licensed under The MIT License [see LICENSE for details]
-# Written by Ze Liu
+# Swin Transformer (Hybrid CNN-Swin + XAI Mod)
+# Copyright (c) 2021 Microsoft, extended for hybrid/XAI
 # --------------------------------------------------------
 
 import os
@@ -16,6 +14,8 @@ import torch.backends.cudnn as cudnn
 import torch.distributed as dist
 import torch.nn.functional as F
 
+from torch.cuda.amp import autocast, GradScaler
+
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 from timm.utils import accuracy, AverageMeter
 
@@ -28,37 +28,27 @@ from logger import create_logger
 from utils import load_checkpoint, save_checkpoint, get_grad_norm, auto_resume_helper, reduce_tensor
 from sklearn.metrics import roc_auc_score
 
-try:
-    # noinspection PyUnresolvedReferences
-    from apex import amp
-except ImportError:
-    amp = None
-
+# ---- XAI imports ----
+from xai_utils.explainability import GradCAM, visualize_prototypes  # Adjust path if needed
 
 def parse_option():
-    parser = argparse.ArgumentParser('Swin Transformer training and evaluation script', add_help=False)
-    parser.add_argument('--cfg', type=str, required=True, metavar="FILE", help='path to config file', )
-    parser.add_argument(
-        "--opts",
-        help="Modify config options by adding 'KEY VALUE' pairs. ",
-        default=None,
-        nargs='+',
+    parser = argparse.ArgumentParser(
+        'Swin Transformer training and evaluation script',
+        add_help=False,
+        conflict_handler='resolve'
     )
-
-    # easy config modification
+    parser.add_argument('--cfg', type=str, required=True, metavar="FILE", help='path to config file')
+    parser.add_argument('--opts', help="Modify config options by adding 'KEY VALUE' pairs.", default=None, nargs='+')
     parser.add_argument('--batch-size', type=int, help="batch size for single GPU")
     parser.add_argument('--data-path', type=str, help='path to dataset')
     parser.add_argument('--zip', action='store_true', help='use zipped dataset instead of folder dataset')
     parser.add_argument('--cache-mode', type=str, default='part', choices=['no', 'full', 'part'],
-                        help='no: no cache, '
-                             'full: cache all data, '
-                             'part: sharding the dataset into nonoverlapping pieces and only cache one piece')
+                        help='no: no cache, full: cache all data, part: sharding the dataset into nonoverlapping pieces and only cache one piece')
     parser.add_argument('--resume', help='resume from checkpoint')
     parser.add_argument('--accumulation-steps', type=int, help="gradient accumulation steps")
-    parser.add_argument('--use-checkpoint', action='store_true',
-                        help="whether to use gradient checkpointing to save memory")
+    parser.add_argument('--use-checkpoint', action='store_true', help="whether to use gradient checkpointing to save memory")
     parser.add_argument('--amp-opt-level', type=str, default='O1', choices=['O0', 'O1', 'O2'],
-                        help='mixed precision opt level, if O0, no amp is used')
+                        help='(IGNORED) mixed precision opt level, if O0, no amp is used')
     parser.add_argument('--output', default='output', type=str, metavar='PATH',
                         help='root of output folder, the full path is <output>/<model_name>/<tag> (default: output)')
     parser.add_argument('--tag', help='tag of experiment')
@@ -66,29 +56,29 @@ def parse_option():
     parser.add_argument('--throughput', action='store_true', help='Test throughput only')
 
     # distributed training
-    parser.add_argument("--local_rank", type=int, required=True, help='local rank for DistributedDataParallel')
+    parser.add_argument("--local_rank", "--local-rank", type=int, default=0, help='local rank for DistributedDataParallel')
 
-    #nih
+    # NIH dataset
     parser.add_argument("--trainset", type=str, required=True, help='path to train dataset')
     parser.add_argument("--validset", type=str, required=True, help='path to validation dataset')
     parser.add_argument("--testset", type=str, required=True, help='path to test dataset')
-    # parser.add_argument("--class_num", required=True, type=int,
-    #                     help="Class number for binary classification, 0-13 for nih")
     parser.add_argument("--train_csv_path", type=str, required=True, help='path to train csv file')
     parser.add_argument("--valid_csv_path", type=str, required=True, help='path to validation csv file')
     parser.add_argument("--test_csv_path", type=str, required=True, help='path to test csv file')
-    parser.add_argument("--num_mlp_heads", type=int, default=3, choices=[0, 1, 2, 3],
-                        help='number of mlp layers at end of network')
+    parser.add_argument("--num_mlp_heads", type=int, default=3, choices=[0, 1, 2, 3], help='number of mlp layers at end of network')
+
+    # ---- XAI options ----
+    parser.add_argument('--xai', action='store_true', help='Enable XAI visualizations (GradCAM/Prototypes)')
+    parser.add_argument('--xai-vis-freq', type=int, default=10, help='Epochs between XAI visualizations')
 
     args, unparsed = parser.parse_known_args()
-
     config = get_config(args)
-
     return args, config
 
-
-def main(config):
+def main(config, args):
     dataset_train, dataset_val, dataset_test, data_loader_train, data_loader_val, data_loader_test, mixup_fn = build_loader(config)
+
+    logger = create_logger(output_dir=config.OUTPUT, dist_rank=dist.get_rank(), name=f"{config.MODEL.NAME}")
 
     logger.info(f"Creating model:{config.MODEL.TYPE}/{config.MODEL.NAME}")
     model = build_model(config)
@@ -96,8 +86,6 @@ def main(config):
     logger.info(str(model))
 
     optimizer = build_optimizer(config, model)
-    if config.AMP_OPT_LEVEL != "O0":
-        model, optimizer = amp.initialize(model, optimizer, opt_level=config.AMP_OPT_LEVEL)
     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[config.LOCAL_RANK], broadcast_buffers=False)
     model_without_ddp = model.module
 
@@ -109,8 +97,14 @@ def main(config):
 
     lr_scheduler = build_scheduler(config, optimizer, len(data_loader_train))
 
-    if config.AUG.MIXUP > 0.:
-        # smoothing is handled with mixup label transform
+    # ---- Hybrid/prototype-aware loss ----
+    if config.MODEL.TYPE == 'hybrid_swin_cnn':
+        def hybrid_loss_fn(outputs, targets):
+            cls_loss = F.binary_cross_entropy_with_logits(outputs['logits'], targets)
+            proto_loss = outputs.get('prototype_loss', torch.tensor(0.0, device=cls_loss.device))
+            return cls_loss + 0.1 * proto_loss
+        criterion = hybrid_loss_fn
+    elif config.AUG.MIXUP > 0.:
         criterion = SoftTargetCrossEntropy()
     elif config.MODEL.LABEL_SMOOTHING > 0.:
         criterion = LabelSmoothingCrossEntropy(smoothing=config.MODEL.LABEL_SMOOTHING)
@@ -118,6 +112,7 @@ def main(config):
         criterion = torch.nn.CrossEntropyLoss()
 
     max_accuracy = 0.0
+    scaler = GradScaler()  # Native PyTorch AMP
 
     if config.TRAIN.AUTO_RESUME:
         resume_file = auto_resume_helper(config.OUTPUT)
@@ -132,13 +127,10 @@ def main(config):
             logger.info(f'no checkpoint found in {config.OUTPUT}, ignoring auto resume')
 
     if config.MODEL.RESUME:
-        max_accuracy = load_checkpoint(config, model_without_ddp, optimizer, lr_scheduler, logger)
-        acc1, acc5, loss = validate(config, data_loader_val, model, is_validation=True)
+        max_accuracy = load_checkpoint(config, model_without_ddp, optimizer, lr_scheduler, logger, scaler)
+        acc1, acc5, loss = validate(config, data_loader_val, model, is_validation=True, args=args)
         logger.info(f"Mean Accuracy of the network on the {len(dataset_val)} validation images: {acc1:.2f}%")
         logger.info(f"Mean Loss of the network on the {len(dataset_val)} validation images: {loss:.5f}")
-        acc1, acc5, loss = validate(config, data_loader_test, model, is_validation=False)
-        logger.info(f"Mean Accuracy of the network on the {len(dataset_test)} test images: {acc1:.2f}%")
-        logger.info(f"Mean Loss of the network on the {len(dataset_test)} test images: {loss:.5f}")
         if config.EVAL_MODE:
             return
 
@@ -152,25 +144,61 @@ def main(config):
     for epoch in range(config.TRAIN.START_EPOCH, config.TRAIN.EPOCHS):
         data_loader_train.sampler.set_epoch(epoch)
 
-        train_one_epoch(config, model, criterion, data_loader_train, optimizer, epoch, mixup_fn, lr_scheduler)
-        if dist.get_rank() == 0 and (epoch % config.SAVE_FREQ == 0 or epoch == (config.TRAIN.EPOCHS - 1)):
-            save_checkpoint(config, epoch, model_without_ddp, max_accuracy, optimizer, lr_scheduler, logger)
+        train_one_epoch(config, model, criterion, data_loader_train, optimizer, epoch, mixup_fn, lr_scheduler, scaler)
 
-        acc1, acc5, loss = validate(config, data_loader_val, model, is_validation=True)
+        # ---- Prototype projection step (every 5 epochs for hybrid) ----
+        if config.MODEL.TYPE == 'hybrid_swin_cnn' and epoch % 5 == 0:
+            if hasattr(model_without_ddp, 'prototype_layer'):
+                logger.info('Projecting prototypes...')
+                def feature_extractor(images):
+                    model_without_ddp.eval()
+                    with torch.no_grad():
+                        cnn_features = model_without_ddp.cnn(images)
+                        x_swin = F.interpolate(images, size=(model_without_ddp.img_size, model_without_ddp.img_size)) \
+                            if images.size(2) != model_without_ddp.img_size or images.size(3) != model_without_ddp.img_size else images
+                        swin_features_list = model_without_ddp.swin(x_swin)
+                        swin_features = swin_features_list[0] if isinstance(swin_features_list, list) else swin_features_list
+                        swin_features = F.interpolate(swin_features, size=cnn_features.shape[2:])
+                        fused_features = torch.cat([cnn_features, swin_features], dim=1)
+                        fused_features = model_without_ddp.fusion(fused_features)
+                    return fused_features
+                model_without_ddp.prototype_layer.project_prototypes(data_loader_train, feature_extractor)
+
+        if dist.get_rank() == 0 and (epoch % config.SAVE_FREQ == 0 or epoch == (config.TRAIN.EPOCHS - 1)):
+            save_checkpoint(config, epoch, model_without_ddp, max_accuracy, optimizer, lr_scheduler, logger, scaler)
+
+        # ---- Validation after each epoch ----
+        acc1, acc5, loss = validate(config, data_loader_val, model, is_validation=True, args=args)
         logger.info(f"Mean Accuracy of the network on the {len(dataset_val)} validation images: {acc1:.2f}%")
         logger.info(f"Mean Loss of the network on the {len(dataset_val)} validation images: {loss:.5f}")
-        acc1, acc5, loss = validate(config, data_loader_test, model, is_validation=False)
-        logger.info(f"Mean Accuracy of the network on the {len(dataset_test)} test images: {acc1:.2f}%")
-        logger.info(f"Mean Loss of the network on the {len(dataset_test)} test images: {loss:.5f}")
         max_accuracy = max(max_accuracy, acc1)
-        logger.info(f'Test Max mean accuracy: {max_accuracy:.2f}%')
+        logger.info(f'Validation Max mean accuracy: {max_accuracy:.2f}%')
+
+        # ---- XAI visualization (every xai-vis-freq epochs) ----
+        if args.xai and (epoch % args.xai_vis_freq == 0):
+            logger.info("Generating XAI visualizations...")
+            grad_cam = GradCAM(model_without_ddp)
+            for i, (samples, targets) in enumerate(data_loader_val):
+                if i >= 5: break
+                samples = samples.cuda(non_blocking=True)
+                outputs = model_without_ddp(samples)
+                logits = outputs['logits']
+                target_class = torch.argmax(logits, dim=1)
+                cam_dict = grad_cam.generate_cam(samples, target_class=target_class)
+                grad_cam.visualize(cam_dict, save_path=os.path.join(config.OUTPUT, f'cam_epoch{epoch}_sample{i}.png'))
+            if hasattr(model_without_ddp, 'prototype_layer'):
+                visualize_prototypes(model_without_ddp, data_loader_train.dataset, save_dir=os.path.join(config.OUTPUT, f'prototypes_epoch{epoch}'))
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     logger.info('Training time {}'.format(total_time_str))
 
+    # ---- Test ONCE after all training ----
+    logger.info("Training complete. Running final test evaluation...")
+    acc1, acc5, loss = validate(config, data_loader_test, model, is_validation=False, args=args)
+    logger.info(f"Test set: Accuracy: {acc1:.2f}%  Loss: {loss:.5f}")
 
-def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mixup_fn, lr_scheduler):
+def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mixup_fn, lr_scheduler, scaler):
     model.train()
     optimizer.zero_grad()
 
@@ -183,60 +211,34 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
     end = time.time()
     for idx, (samples, targets) in enumerate(data_loader):
         samples = samples.cuda(non_blocking=True)
-        for i in range(len(targets)):
-            targets[i] = targets[i].cuda(non_blocking=True)
+        targets = targets.cuda(non_blocking=True).float()  # Ensure targets shape [B, 14] and float
 
-        if mixup_fn is not None:
-            samples, targets = mixup_fn(samples, targets)   #todo iterate on targets
+        # Remove mixup for multi-label unless you have a multi-label compatible mixup
+        # if mixup_fn is not None:
+        #     samples, targets = mixup_fn(samples, targets)
 
-        outputs = model(samples)
-
-        if config.TRAIN.ACCUMULATION_STEPS > 1:
-            loss = criterion(outputs[0], targets[0])
-            for i in range(1, len(targets)):
-                loss += criterion(outputs[i], targets[i])
-            loss = loss / config.TRAIN.ACCUMULATION_STEPS
-            if config.AMP_OPT_LEVEL != "O0":
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-                if config.TRAIN.CLIP_GRAD:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), config.TRAIN.CLIP_GRAD)
-                else:
-                    grad_norm = get_grad_norm(amp.master_params(optimizer))
+        with autocast():
+            outputs = model(samples)
+            if config.MODEL.TYPE == 'hybrid_swin_cnn':
+                loss = criterion(outputs, targets)
             else:
-                loss.backward()
-                if config.TRAIN.CLIP_GRAD:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.TRAIN.CLIP_GRAD)
-                else:
-                    grad_norm = get_grad_norm(model.parameters())
-            if (idx + 1) % config.TRAIN.ACCUMULATION_STEPS == 0:
-                optimizer.step()
-                optimizer.zero_grad()
-                lr_scheduler.step_update(epoch * num_steps + idx)
+                loss = criterion(outputs[0], targets)
+                for i in range(1, len(targets)):
+                    loss += criterion(outputs[i], targets[i])
+
+        scaler.scale(loss).backward()
+        if config.TRAIN.CLIP_GRAD:
+            scaler.unscale_(optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.TRAIN.CLIP_GRAD)
         else:
-            loss = criterion(outputs[0], targets[0])
-            for i in range(1, len(targets)):
-                loss += criterion(outputs[i], targets[i])
-            optimizer.zero_grad()
-            if config.AMP_OPT_LEVEL != "O0":
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-                if config.TRAIN.CLIP_GRAD:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), config.TRAIN.CLIP_GRAD)
-                else:
-                    grad_norm = get_grad_norm(amp.master_params(optimizer))
-            else:
-                loss.backward()
-                if config.TRAIN.CLIP_GRAD:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.TRAIN.CLIP_GRAD)
-                else:
-                    grad_norm = get_grad_norm(model.parameters())
-            optimizer.step()
-            lr_scheduler.step_update(epoch * num_steps + idx)
+            grad_norm = get_grad_norm(model.parameters())
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad()
+        lr_scheduler.step_update(epoch * num_steps + idx)
 
         torch.cuda.synchronize()
-
-        loss_meter.update(loss.item(), targets[0].size(0))
+        loss_meter.update(loss.item(), samples.size(0))
         norm_meter.update(grad_norm)
         batch_time.update(time.time() - end)
         end = time.time()
@@ -245,7 +247,7 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
             lr = optimizer.param_groups[0]['lr']
             memory_used = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
             etas = batch_time.avg * (num_steps - idx)
-            logger.info(
+            print(
                 f'Train: [{epoch}/{config.TRAIN.EPOCHS}][{idx}/{num_steps}]\t'
                 f'eta {datetime.timedelta(seconds=int(etas))} lr {lr:.6f}\t'
                 f'time {batch_time.val:.4f} ({batch_time.avg:.4f})\t'
@@ -254,7 +256,7 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
                 f'mem {memory_used:.0f}MB')
     lr = optimizer.param_groups[0]['lr']
     memory_used = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
-    logger.info(
+    print(
         f'Train: [{epoch}/{config.TRAIN.EPOCHS}]\t'
         f'lr {lr:.6f}\t'
         f'time {batch_time.val:.4f} ({batch_time.avg:.4f})\t'
@@ -262,103 +264,81 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
         f'grad_norm {norm_meter.val:.4f} ({norm_meter.avg:.4f})\t'
         f'mem {memory_used:.0f}MB')
     epoch_time = time.time() - start
-    logger.info(f"EPOCH {epoch} training takes {datetime.timedelta(seconds=int(epoch_time))}")
-
+    print(f"EPOCH {epoch} training takes {datetime.timedelta(seconds=int(epoch_time))}")
 
 @torch.no_grad()
-def validate(config, data_loader, model, is_validation):
+def validate(config, data_loader, model, is_validation, args=None):
     valid_or_test = "Validation" if is_validation else "Test"
-    criterion = torch.nn.CrossEntropyLoss()
     model.eval()
 
-    batch_time = [AverageMeter() for _ in range(14)]
-    loss_meter = [AverageMeter() for _ in range(14)]
-    acc1_meter = [AverageMeter() for _ in range(14)]
-    acc5_meter = [AverageMeter() for _ in range(14)]
+    batch_time = AverageMeter()
+    loss_meter = AverageMeter()
+    acc1_meter = AverageMeter()
 
-    acc1s = []
-    acc5s = []
-    losses = []
-    aucs = []
+    all_targets = []
+    all_outputs = []
 
     end = time.time()
-    all_preds = [[] for _ in range(14)]
-    all_label = [[] for _ in range(14)]
-    for idx, (images, target) in enumerate(data_loader):
+    for idx, (images, targets) in enumerate(data_loader):
         images = images.cuda(non_blocking=True)
-        for i in range(len(target)):
-            target[i] = target[i].cuda(non_blocking=True)
-
-        # compute output
+        targets = targets.cuda(non_blocking=True).float()  # [B, 14]
         output = model(images)
+        logits = output['logits']
 
-        for i in range(len(target)):
-            # measure accuracy and record loss
-            loss = criterion(output[i], target[i])
-            # acc1, acc5 = accuracy(output, target, topk=(1, 5))
-            acc1 = accuracy(output[i], target[i], topk=(1,))
-            acc1 = torch.Tensor(acc1).to(device='cuda')
-            acc1 = reduce_tensor(acc1)
-            # acc5 = reduce_tensor(acc5)
-            loss = reduce_tensor(loss)
+        loss = F.binary_cross_entropy_with_logits(logits, targets)
+        loss_meter.update(loss.item(), images.size(0))
 
-            loss_meter[i].update(loss.item(), target[i].size(0))
-            acc1_meter[i].update(acc1.item(), target[i].size(0))
-            # acc5_meter.update(acc5.item(), target.size(0))
+        preds = (torch.sigmoid(logits) > 0.5).float()
+        correct = (preds == targets).float().mean()
+        acc1_meter.update(correct.item(), images.size(0))
 
-            # auc
-            preds = F.softmax(output[i], dim=1)
-            if len(all_preds[i]) == 0:
-                all_preds[i].append(preds.detach().cpu().numpy())
-                all_label[i].append(target[i].detach().cpu().numpy())
-            else:
-                all_preds[i][0] = np.append(
-                    all_preds[i][0], preds.detach().cpu().numpy(), axis=0
-                )
-                all_label[i][0] = np.append(
-                    all_label[i][0], target[i].detach().cpu().numpy(), axis=0
-                )
+        all_targets.append(targets.cpu().numpy())
+        all_outputs.append(torch.sigmoid(logits).cpu().numpy())
 
-            # measure elapsed time
-            batch_time[i].update(time.time() - end)
-            end = time.time()
+        batch_time.update(time.time() - end)
+        end = time.time()
 
-            if idx % config.PRINT_FREQ == 0:
-                memory_used = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
-                logger.info(
-                    f'{valid_or_test}: [{idx}/{len(data_loader)}]\t'
-                    f'Time {batch_time[i].val:.3f} ({batch_time[i].avg:.3f})\t'
-                    f'Loss {loss_meter[i].val:.4f} ({loss_meter[i].avg:.4f})\t'
-                    f'Acc@1 {acc1_meter[i].val:.3f} ({acc1_meter[i].avg:.3f})\t'
-                    # f'Acc@5 {acc5_meter[i].val:.3f} ({acc5_meter[i].avg:.3f})\t'
-                    f'Mem {memory_used:.0f}MB\t'
-                    f'Class {i}')
+        if idx % config.PRINT_FREQ == 0:
+            memory_used = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
+            print(
+                f'{valid_or_test}: [{idx}/{len(data_loader)}]\t'
+                f'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                f'Loss {loss_meter.val:.4f} ({loss_meter.avg:.4f})\t'
+                f'Acc@1 {acc1_meter.val:.3f} ({acc1_meter.avg:.3f})\t'
+                f'Mem {memory_used:.0f}MB'
+            )
 
-    for i in range(14):
-        # auc
-        all_preds[i], all_label[i] = all_preds[i][0], all_label[i][0]
-        auc = roc_auc_score(all_label[i], all_preds[i][:, 1], multi_class='ovr')
-        # logger.info("Valid AUC: %2.5f" % auc)
-        logger.info(f' * Acc@1 {acc1_meter[i].avg:.3f}\t'
-                    f'Acc@5 {acc5_meter[i].avg:.3f}\t'
-                    f'{valid_or_test} AUC {auc:.5f}\t'
-                    f'Class {i}')
-
-        acc1s.append(acc1_meter[i].avg)
-        acc5s.append(acc5_meter[i].avg)
-        losses.append(loss_meter[i].avg)
+    all_targets = np.concatenate(all_targets, axis=0)
+    all_outputs = np.concatenate(all_outputs, axis=0)
+    aucs = []
+    for i in range(all_targets.shape[1]):
+        try:
+            auc = roc_auc_score(all_targets[:, i], all_outputs[:, i])
+        except Exception:
+            auc = float('nan')
         aucs.append(auc)
-
     from statistics import mean
-    logger.info(f'{valid_or_test} MEAN AUC: {mean(aucs):.5f}')
+    print(f'{valid_or_test} MEAN AUC: {mean([a for a in aucs if not np.isnan(a)]):.5f}')
 
-    return mean(acc1s), mean(acc5s), mean(losses)
+    if args is not None and args.xai and valid_or_test == "Test":
+        print("Generating XAI visualizations on test set...")
+        grad_cam = GradCAM(model.module if hasattr(model, 'module') else model)
+        for i, (samples, targets) in enumerate(data_loader):
+            if i >= 5: break
+            samples = samples.cuda(non_blocking=True)
+            outputs = model.module(samples) if hasattr(model, 'module') else model(samples)
+            logits = outputs['logits']
+            target_class = torch.argmax(logits, dim=1)
+            cam_dict = grad_cam.generate_cam(samples, target_class=target_class)
+            grad_cam.visualize(cam_dict, save_path=os.path.join(config.OUTPUT, f'cam_test_sample{i}.png'))
+        if hasattr(model, 'prototype_layer'):
+            visualize_prototypes(model, data_loader.dataset, save_dir=os.path.join(config.OUTPUT, f'prototypes_test'))
 
+    return acc1_meter.avg, 0, loss_meter.avg
 
 @torch.no_grad()
 def throughput(data_loader, model, logger):
     model.eval()
-
     for idx, (images, _) in enumerate(data_loader):
         images = images.cuda(non_blocking=True)
         batch_size = images.shape[0]
@@ -374,12 +354,8 @@ def throughput(data_loader, model, logger):
         logger.info(f"batch_size {batch_size} throughput {30 * batch_size / (tic2 - tic1)}")
         return
 
-
 if __name__ == '__main__':
-    _, config = parse_option()
-
-    if config.AMP_OPT_LEVEL != "O0":
-        assert amp is not None, "amp not installed!"
+    args, config = parse_option()
 
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
         rank = int(os.environ["RANK"])
@@ -397,11 +373,9 @@ if __name__ == '__main__':
     np.random.seed(seed)
     cudnn.benchmark = True
 
-    # linear scale the learning rate according to total batch size, may not be optimal
     linear_scaled_lr = config.TRAIN.BASE_LR * config.DATA.BATCH_SIZE * dist.get_world_size() / 512.0
     linear_scaled_warmup_lr = config.TRAIN.WARMUP_LR * config.DATA.BATCH_SIZE * dist.get_world_size() / 512.0
     linear_scaled_min_lr = config.TRAIN.MIN_LR * config.DATA.BATCH_SIZE * dist.get_world_size() / 512.0
-    # gradient accumulation also need to scale the learning rate
     if config.TRAIN.ACCUMULATION_STEPS > 1:
         linear_scaled_lr = linear_scaled_lr * config.TRAIN.ACCUMULATION_STEPS
         linear_scaled_warmup_lr = linear_scaled_warmup_lr * config.TRAIN.ACCUMULATION_STEPS
@@ -421,7 +395,6 @@ if __name__ == '__main__':
             f.write(config.dump())
         logger.info(f"Full config saved to {path}")
 
-    # print config
     logger.info(config.dump())
 
-    main(config)
+    main(config, args)
