@@ -1,4 +1,5 @@
 # configs/hybrid_swin_cnn.yaml
+OUTPUT: /content/drive/MyDrive
 MODEL:
   TYPE: hybrid_swin_cnn
   CNN_BACKBONE: 'resnet50'  # Options: resnet50, efficientnet_b0, etc.
