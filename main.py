@@ -193,6 +193,12 @@ def main(config, args):
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     logger.info('Training time {}'.format(total_time_str))
 
+    # ---- Save model to output/drive before test ----
+    if dist.get_rank() == 0:
+        model_save_path = os.path.join(config.OUTPUT, "final_model.pth")
+        torch.save(model_without_ddp.state_dict(), model_save_path)
+        logger.info(f"Model weights saved to {model_save_path}")
+
     # ---- Test ONCE after all training ----
     logger.info("Training complete. Running final test evaluation...")
     acc1, acc5, loss = validate(config, data_loader_test, model, is_validation=False, args=args)
@@ -320,17 +326,19 @@ def validate(config, data_loader, model, is_validation, args=None):
     from statistics import mean
     print(f'{valid_or_test} MEAN AUC: {mean([a for a in aucs if not np.isnan(a)]):.5f}')
 
+    # ---- Grad-CAM block: enable gradients ----
     if args is not None and args.xai and valid_or_test == "Test":
         print("Generating XAI visualizations on test set...")
         grad_cam = GradCAM(model.module if hasattr(model, 'module') else model)
         for i, (samples, targets) in enumerate(data_loader):
             if i >= 5: break
             samples = samples.cuda(non_blocking=True)
-            outputs = model.module(samples) if hasattr(model, 'module') else model(samples)
-            logits = outputs['logits']
-            target_class = torch.argmax(logits, dim=1)
-            cam_dict = grad_cam.generate_cam(samples, target_class=target_class)
-            grad_cam.visualize(cam_dict, save_path=os.path.join(config.OUTPUT, f'cam_test_sample{i}.png'))
+            with torch.enable_grad():  # <-- Enable gradients for Grad-CAM!
+                outputs = model.module(samples) if hasattr(model, 'module') else model(samples)
+                logits = outputs['logits']
+                target_class = torch.argmax(logits, dim=1)
+                cam_dict = grad_cam.generate_cam(samples, target_class=target_class)
+                grad_cam.visualize(cam_dict, save_path=os.path.join(config.OUTPUT, f'cam_test_sample{i}.png'))
         if hasattr(model, 'prototype_layer'):
             visualize_prototypes(model, data_loader.dataset, save_dir=os.path.join(config.OUTPUT, f'prototypes_test'))
 
