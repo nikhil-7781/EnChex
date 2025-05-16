@@ -193,17 +193,6 @@ def main(config, args):
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     logger.info('Training time {}'.format(total_time_str))
 
-    # ---- Save model before test ----
-    if dist.get_rank() == 0:
-        final_model_path = os.path.join(config.OUTPUT, 'final_model.pth')
-        torch.save({
-            'model': model_without_ddp.state_dict(),
-            'config': config.dump(),
-            'epoch': config.TRAIN.EPOCHS,
-            'scaler': scaler.state_dict(),
-        }, final_model_path)
-        logger.info(f"Final model saved to {final_model_path}")
-
     # ---- Test ONCE after all training ----
     logger.info("Training complete. Running final test evaluation...")
     acc1, acc5, loss = validate(config, data_loader_test, model, is_validation=False, args=args)
@@ -223,6 +212,10 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
     for idx, (samples, targets) in enumerate(data_loader):
         samples = samples.cuda(non_blocking=True)
         targets = targets.cuda(non_blocking=True).float()  # Ensure targets shape [B, 14] and float
+
+        # Remove mixup for multi-label unless you have a multi-label compatible mixup
+        # if mixup_fn is not None:
+        #     samples, targets = mixup_fn(samples, targets)
 
         with autocast():
             outputs = model(samples)
@@ -261,6 +254,17 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
                 f'loss {loss_meter.val:.4f} ({loss_meter.avg:.4f})\t'
                 f'grad_norm {norm_meter.val:.4f} ({norm_meter.avg:.4f})\t'
                 f'mem {memory_used:.0f}MB')
+    lr = optimizer.param_groups[0]['lr']
+    memory_used = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
+    print(
+        f'Train: [{epoch}/{config.TRAIN.EPOCHS}]\t'
+        f'lr {lr:.6f}\t'
+        f'time {batch_time.val:.4f} ({batch_time.avg:.4f})\t'
+        f'loss {loss_meter.val:.4f} ({loss_meter.avg:.4f})\t'
+        f'grad_norm {norm_meter.val:.4f} ({norm_meter.avg:.4f})\t'
+        f'mem {memory_used:.0f}MB')
+    epoch_time = time.time() - start
+    print(f"EPOCH {epoch} training takes {datetime.timedelta(seconds=int(epoch_time))}")
 
 @torch.no_grad()
 def validate(config, data_loader, model, is_validation, args=None):
@@ -294,6 +298,16 @@ def validate(config, data_loader, model, is_validation, args=None):
         batch_time.update(time.time() - end)
         end = time.time()
 
+        if idx % config.PRINT_FREQ == 0:
+            memory_used = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
+            print(
+                f'{valid_or_test}: [{idx}/{len(data_loader)}]\t'
+                f'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                f'Loss {loss_meter.val:.4f} ({loss_meter.avg:.4f})\t'
+                f'Acc@1 {acc1_meter.val:.3f} ({acc1_meter.avg:.3f})\t'
+                f'Mem {memory_used:.0f}MB'
+            )
+
     all_targets = np.concatenate(all_targets, axis=0)
     all_outputs = np.concatenate(all_outputs, axis=0)
     aucs = []
@@ -306,19 +320,19 @@ def validate(config, data_loader, model, is_validation, args=None):
     from statistics import mean
     print(f'{valid_or_test} MEAN AUC: {mean([a for a in aucs if not np.isnan(a)]):.5f}')
 
-    # ---- XAI visualization on test set ----
     if args is not None and args.xai and valid_or_test == "Test":
-        print("Generating XAI visualizations...")
+        print("Generating XAI visualizations on test set...")
         grad_cam = GradCAM(model.module if hasattr(model, 'module') else model)
         for i, (samples, targets) in enumerate(data_loader):
             if i >= 5: break
             samples = samples.cuda(non_blocking=True)
-            with torch.enable_grad():  # Enable gradients for Grad-CAM
-                outputs = model(samples)
-                logits = outputs['logits']
-                target_class = torch.argmax(logits, dim=1)
-                cam_dict = grad_cam.generate_cam(samples, target_class=target_class)
-                grad_cam.visualize(cam_dict, save_path=os.path.join(config.OUTPUT, f'cam_test_sample{i}.png'))
+            outputs = model.module(samples) if hasattr(model, 'module') else model(samples)
+            logits = outputs['logits']
+            target_class = torch.argmax(logits, dim=1)
+            cam_dict = grad_cam.generate_cam(samples, target_class=target_class)
+            grad_cam.visualize(cam_dict, save_path=os.path.join(config.OUTPUT, f'cam_test_sample{i}.png'))
+        if hasattr(model, 'prototype_layer'):
+            visualize_prototypes(model, data_loader.dataset, save_dir=os.path.join(config.OUTPUT, f'prototypes_test'))
 
     return acc1_meter.avg, 0, loss_meter.avg
 
@@ -358,6 +372,19 @@ if __name__ == '__main__':
     torch.manual_seed(seed)
     np.random.seed(seed)
     cudnn.benchmark = True
+
+    linear_scaled_lr = config.TRAIN.BASE_LR * config.DATA.BATCH_SIZE * dist.get_world_size() / 512.0
+    linear_scaled_warmup_lr = config.TRAIN.WARMUP_LR * config.DATA.BATCH_SIZE * dist.get_world_size() / 512.0
+    linear_scaled_min_lr = config.TRAIN.MIN_LR * config.DATA.BATCH_SIZE * dist.get_world_size() / 512.0
+    if config.TRAIN.ACCUMULATION_STEPS > 1:
+        linear_scaled_lr = linear_scaled_lr * config.TRAIN.ACCUMULATION_STEPS
+        linear_scaled_warmup_lr = linear_scaled_warmup_lr * config.TRAIN.ACCUMULATION_STEPS
+        linear_scaled_min_lr = linear_scaled_min_lr * config.TRAIN.ACCUMULATION_STEPS
+    config.defrost()
+    config.TRAIN.BASE_LR = linear_scaled_lr
+    config.TRAIN.WARMUP_LR = linear_scaled_warmup_lr
+    config.TRAIN.MIN_LR = linear_scaled_min_lr
+    config.freeze()
 
     os.makedirs(config.OUTPUT, exist_ok=True)
     logger = create_logger(output_dir=config.OUTPUT, dist_rank=dist.get_rank(), name=f"{config.MODEL.NAME}")
